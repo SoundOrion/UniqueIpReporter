@@ -22,16 +22,25 @@ public class UniqueIpStore
     {
         var now = DateTime.UtcNow;
 
-        // 新規追加をまず試みる
         if (_ips.TryAdd(ip, now))
         {
-            // ★ 初めて見た IP → イベント発火（ログ）
             using (LogContext.PushProperty("EventType", "IpFirstSeen"))
+            using (LogContext.PushProperty("Ip", ip.ToString()))
             {
-                _logger.LogInformation("IP first seen {Ip} at {Utc}", ip, now);
+                _logger.LogInformation("New IP detected: {Ip} at {Utc}", ip, now);
             }
-            return true;
         }
+
+        //// 新規追加をまず試みる
+        //if (_ips.TryAdd(ip, now))
+        //{
+        //    // ★ 初めて見た IP → イベント発火（ログ）
+        //    using (LogContext.PushProperty("EventType", "IpFirstSeen"))
+        //    {
+        //        _logger.LogInformation("IP first seen {Ip} at {Utc}", ip, now);
+        //    }
+        //    return true;
+        //}
 
         // 既存ならタイムスタンプ更新
         _ips[ip] = now;
