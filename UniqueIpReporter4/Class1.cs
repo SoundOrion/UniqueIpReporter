@@ -12,10 +12,12 @@ using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.IO;
+using System.IO.Compression;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading.Channels;
+using System.Threading.RateLimiting;
 
 #region モデル/ストア
 public enum SendStatus { Unknown, Success, Timeout, Refused, Reset, NetworkError, OtherError }
@@ -55,6 +57,37 @@ public sealed class TargetDiscoveryService : BackgroundService
         _logger = logger;
         _udpPort = udpPort;
         _expireAfter = expireAfter ?? TimeSpan.FromHours(1);
+    }
+
+    protected override async Task ExecuteAsync_(CancellationToken stoppingToken)
+    {
+        const string mcast = "239.0.0.1";
+        using var udp = new UdpClient(AddressFamily.InterNetwork);
+        udp.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+        udp.Client.Bind(new IPEndPoint(IPAddress.Any, _udpPort));
+        udp.JoinMulticastGroup(IPAddress.Parse(mcast));
+
+        _ = CleanupLoop(stoppingToken);
+        _logger.LogInformation("Discovery: v4 mcast {Mcast}:{Port}", mcast, _udpPort);
+
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            try
+            {
+                var result = await udp.ReceiveAsync(stoppingToken);
+                // 認証トークン検証などここで
+                var ip = result.RemoteEndPoint.Address;
+                var now = DateTime.UtcNow;
+
+                _store.Targets.AddOrUpdate(ip, _ => new TargetInfo(now), (_, old) => old with { LastSeenUtc = now });
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { break; }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Discovery receive failed");
+                await Task.Delay(1000, stoppingToken);
+            }
+        }
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -115,6 +148,90 @@ public sealed record SendResult(IPAddress Ip, SendStatus Status, string? Error =
 
 public static class BurstTcpBroadcaster
 {
+    using System.Collections.Concurrent;
+using System.Net;
+using System.Net.Sockets;
+using System.Threading.RateLimiting;
+
+public static class BurstTcpBroadcaster
+{
+    /// <summary>
+    /// 大量宛先に対する都度接続のブロードキャスト（並列上限＋毎秒接続レート制御）。
+    /// </summary>
+    public static async Task<IReadOnlyList<SendResult>> BroadcastAsync_(
+        IEnumerable<IPAddress> ips,
+        int port,
+        ReadOnlyMemory<byte> payload,
+        int connectTimeoutMs = 3000,
+        int sendTimeoutMs = 3000,
+        int maxConcurrency = 256,
+        int connectPerSecondLimit = 200,
+        CancellationToken ct = default)
+    {
+        var endpoints = ips.Select(ip => new IPEndPoint(ip, port)).ToArray();
+        var results = new ConcurrentBag<SendResult>();
+
+        // 1) 1秒あたり connectPerSecondLimit 個の「接続開始」を許可するトークンバケット
+        using var limiter = new TokenBucketRateLimiter(new TokenBucketRateLimiterOptions
+        {
+            TokenLimit = connectPerSecondLimit,        // バケット容量（初回バースト許容量）
+            TokensPerPeriod = connectPerSecondLimit,   // 毎秒補充トークン数
+            ReplenishmentPeriod = TimeSpan.FromSeconds(1),
+            AutoReplenishment = true,
+            QueueLimit = maxConcurrency * 2,           // 待たせる最大件数（環境に合わせて）
+            QueueProcessingOrder = QueueProcessingOrder.OldestFirst
+        });
+
+        // 2) 同時実行は maxConcurrency まで
+        var po = new ParallelOptions { MaxDegreeOfParallelism = maxConcurrency, CancellationToken = ct };
+
+        await Parallel.ForEachAsync(endpoints, po, async (ep, token) =>
+        {
+            // レート制御：接続開始トークンを取得
+            using var lease = await limiter.AcquireAsync(1, token);
+            if (!lease.IsAcquired) return; // キュー超過などで取得失敗
+
+            // 1宛先分の接続→送信
+            var r = await SendOnceAsync(ep, payload, connectTimeoutMs, sendTimeoutMs, token);
+            results.Add(r);
+        });
+
+        return results.ToArray();
+    }
+}
+
+public static async Task<IReadOnlyList<SendResult>> BroadcastAsync_(
+    IEnumerable<IPAddress> ips, int port, ReadOnlyMemory<byte> payload,
+    int connectTimeoutMs = 3000, int sendTimeoutMs = 3000,
+    int maxConcurrency = 256, int connectPerSecondLimit = 200,
+    CancellationToken ct = default)
+    {
+        var endpoints = ips.Select(ip => new IPEndPoint(ip, port));
+
+        var limiter = new TokenBucketRateLimiter(new TokenBucketRateLimiterOptions
+        {
+            TokenLimit = connectPerSecondLimit,
+            TokensPerPeriod = connectPerSecondLimit,
+            ReplenishmentPeriod = TimeSpan.FromSeconds(1),
+            AutoReplenishment = true,
+            QueueLimit = int.MaxValue
+        });
+
+        var results = new ConcurrentBag<SendResult>();
+        var po = new ParallelOptions { MaxDegreeOfParallelism = maxConcurrency, CancellationToken = ct };
+
+        await Parallel.ForEachAsync(endpoints, po, async (ep, token) =>
+        {
+            using var lease = await limiter.AcquireAsync(1, token);
+            if (!lease.IsAcquired) return;
+
+            var r = await SendOnceAsync(ep, payload, connectTimeoutMs, sendTimeoutMs, token);
+            results.Add(r);
+        });
+
+        return results.ToArray();
+    }
+
     public static async Task<IReadOnlyList<SendResult>> BroadcastAsync(
         IEnumerable<IPAddress> ips,
         int port,
@@ -394,3 +511,59 @@ public sealed class BroadcastJobService : BackgroundService
 
 //という認識が正しくて、
 //しかも「逆方向もあるけど出番が少ない」っていう、地味に歴史の名残りを今でも背負ってるAPIなんです 😊
+
+public static class Framing
+{
+    /// <summary>
+    /// 生データを Deflate 圧縮し、圧縮の方が短ければ「負の長さ + 圧縮データ」、
+    /// そうでなければ「正の長さ + 生データ」を Little Endian で送る（非同期版）。
+    /// </summary>
+    public static async ValueTask SendFrameLEAsync(
+        Stream s,
+        ReadOnlyMemory<byte> raw,
+        CompressionLevel level = CompressionLevel.Optimal,
+        CancellationToken ct = default)
+    {
+        if (s is null) throw new ArgumentNullException(nameof(s));
+        if (!s.CanWrite) throw new InvalidOperationException("Stream is not writable.");
+
+        // まず常に圧縮を試す（可変長 MemoryStream に圧縮を書き出し）
+        int compLen;
+        ReadOnlyMemory<byte> compMem;
+        var ms = new MemoryStream(capacity: raw.Length);
+        await using (ms.ConfigureAwait(false))
+        await using (var ds = new DeflateStream(ms, level, leaveOpen: true))
+        {
+            await ds.WriteAsync(raw, ct).ConfigureAwait(false);
+            // FlushAsync は必須ではないが、早期に OS バッファへ流したい場合に有効
+            await ds.FlushAsync(ct).ConfigureAwait(false);
+        } // DisposeAsync によりフッタも書かれ、ms.Position が確定
+
+        compLen = checked((int)ms.Position);
+        if (!ms.TryGetBuffer(out ArraySegment<byte> seg))
+        {
+            // ほぼ起きないが、念のため ToArray にフォールバック
+            compMem = new ReadOnlyMemory<byte>(ms.ToArray(), 0, compLen);
+        }
+        else
+        {
+            compMem = new ReadOnlyMemory<byte>(seg.Array!, 0, compLen);
+        }
+
+        // どちらを送るか決定
+        bool useCompressed = compLen < raw.Length;
+        int length = useCompressed ? -compLen : raw.Length;
+        ReadOnlyMemory<byte> payload = useCompressed ? compMem : raw;
+
+        // 長さ（LE）を書いてから本体
+        Span<byte> lenBytes = stackalloc byte[4];
+        BinaryPrimitives.WriteInt32LittleEndian(lenBytes, length);
+
+        await s.WriteAsync(lenBytes, ct).ConfigureAwait(false);
+        await s.WriteAsync(payload, ct).ConfigureAwait(false);
+    }
+
+    // 同期APIが必要なら薄いラッパーを用意
+    public static void SendFrameLE(Stream s, ReadOnlySpan<byte> raw)
+        => SendFrameLEAsync(s, raw.ToArray()).GetAwaiter().GetResult();
+}
