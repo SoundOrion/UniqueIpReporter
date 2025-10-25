@@ -272,3 +272,70 @@ namespace ZipReplace48
             Console.WriteLine("[{0:yyyy-MM-dd HH:mm:ss}] {1}", DateTime.Now, message);
     }
 }
+
+
+
+//var psi = new ProcessStartInfo
+//{
+//    FileName = "cmd.exe",
+//    Arguments = "/c \"\"C:\\path\\to\\ZipReplace48.exe\" >NUL 2>&1\"",
+//    UseShellExecute = false,     // 必須：コンソール/シェル非使用
+//    CreateNoWindow = true,       // 必須：ウィンドウ抑止
+//    WindowStyle = ProcessWindowStyle.Hidden,
+//    WorkingDirectory = @"C:\temp\Work"
+//};
+//using (var p = Process.Start(psi))
+//{
+//    p.WaitForExit();
+//    var exitCode = p.ExitCode;
+//}
+
+//`> NUL 2 > &1` は、Windowsの **コマンドプロンプトで出力を捨てるためのリダイレクト構文** です。
+//つまり、**`cmd.exe /c` で呼び出したときに一切表示も残さない**ための指定です。
+
+//---
+
+//### 🔧 分解して説明すると
+
+//| 部分    | 意味                                               |
+//| ----- | ------------------------------------------------ |
+//| `>`   | 標準出力（普通の `Console.WriteLine` など）をどこかにリダイレクトする演算子 |
+//| `NUL` | どこにも出力しない特殊デバイス（UNIXで言う `/dev/null` と同じ）         |
+//| `2>`  | 標準エラー（例外や `Console.Error.WriteLine`）をどこかにリダイレクト  |
+//| `&1`  | 「標準出力(1) と同じところへ送れ」という指定                         |
+
+//したがって：
+
+//```bat
+//> NUL 2>&1
+//```
+
+//=
+//✅ 標準出力を NUL に捨てる
+//✅ 標準エラーも標準出力（つまり NUL）と同じ場所に捨てる
+//→ 結果的に **何も表示もログも残らない完全サイレント実行** になります。
+
+//---
+
+//### 🧩 具体例
+
+//```bat
+//C:\path\to\ZipReplace48.exe >NUL 2>&1
+//```
+
+//これを実行すると：
+
+//* `Console.WriteLine` の出力 → 消える
+//* 例外時の `Console.Error` 出力 → 消える
+//* コマンドプロンプト上にもウィンドウにも一切出ない
+
+//---
+
+//### 💡 つまりこう覚えると簡単
+
+//> `>NUL 2>&1` = 「全部どこにも出さないで実行して」
+
+//---
+
+//サービスから `cmd.exe /c` で呼ぶ場合にこれを付けておけば、
+//**画面にもログにも出ず、完全なバックグラウンド処理**になります。
