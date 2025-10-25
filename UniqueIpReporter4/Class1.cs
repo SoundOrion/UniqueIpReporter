@@ -5,15 +5,16 @@
 //  - 今回はその完全版: 共有ストア、UDP自動発見例、期限切れ掃除、
 //    20分ジョブで都度接続・レート制御付き一斉送信、結果をストアに反映
 
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using System.Buffers;
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading.Channels;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
 
 #region モデル/ストア
 public enum SendStatus { Unknown, Success, Timeout, Refused, Reset, NetworkError, OtherError }
@@ -148,6 +149,22 @@ public static class BurstTcpBroadcaster
         return results.ToArray();
     }
 
+    /// <summary>
+    /// レート制御用のトークンバケットを定期的に補充するループ。
+    /// </summary>
+    /// <param name="sem">接続開始を制御するための <see cref="SemaphoreSlim"/>。現在の残トークン数を保持します。</param>
+    /// <param name="limit">1秒あたりに許可する最大接続数。トークンの最大数でもあります。</param>
+    /// <param name="ct">キャンセル要求を検出するための <see cref="CancellationToken"/>。</param>
+    /// <remarks>
+    /// このメソッドは非同期ループとして動作し、1秒ごとにトークンを補充します。
+    /// <para>
+    /// <list type="bullet">
+    /// <item><description><c>SemaphoreSlim.WaitAsync()</c> でトークンを1つ消費します。</description></item>
+    /// <item><description><c>TokenRefillLoop</c> が 1 秒ごとにトークンを補充し、最大値 (<paramref name="limit"/>) に戻します。</description></item>
+    /// <item><description>結果として、「1秒あたり最大 <paramref name="limit"/> 接続」の滑らかなレート制御が実現します。</description></item>
+    /// </list>
+    /// </para>
+    /// </remarks>
     private static async Task TokenRefillLoop(SemaphoreSlim sem, int limit, CancellationToken ct)
     {
         while (!ct.IsCancellationRequested)
@@ -175,6 +192,12 @@ public static class BurstTcpBroadcaster
             }
 
             using var stream = client.GetStream();
+
+            //Span<byte> lenBuf = stackalloc byte[4];
+            //BinaryPrimitives.WriteInt32BigEndian(lenBuf, payload.Length);
+            //await stream.WriteAsync(lenBuf, ct);
+            //await stream.WriteAsync(payload, ct);
+
             var len = BitConverter.GetBytes(IPAddress.HostToNetworkOrder(payload.Length));
 
             using (var cts = new CancellationTokenSource(sendTimeoutMs))
