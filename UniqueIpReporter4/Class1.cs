@@ -11,6 +11,7 @@ using Microsoft.Extensions.Logging;
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
+using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -195,8 +196,9 @@ public static class BurstTcpBroadcaster
 
             //Span<byte> lenBuf = stackalloc byte[4];
             //BinaryPrimitives.WriteInt32BigEndian(lenBuf, payload.Length);
-            //await stream.WriteAsync(lenBuf, ct);
+            //stream.Write(lenBuf);
             //await stream.WriteAsync(payload, ct);
+            //await stream.FlushAsync(ct);
 
             var len = BitConverter.GetBytes(IPAddress.HostToNetworkOrder(payload.Length));
 
@@ -329,3 +331,66 @@ public sealed class BroadcastJobService : BackgroundService
 // });
 // await builder.Build().RunAsync();
 #endregion
+
+//そうそう、それ、すごく良い観察です👏
+
+//実は `IPAddress.HostToNetworkOrder()` というメソッドは、**歴史的に「ネットワークはビッグエンディアン」という前提で作られている**からこそ存在するんです。
+//そして、「逆方向（NetworkToHostOrder）」もちゃんとあるんですよ！　でも普段あまり見ないだけです。
+
+//---
+
+//## 🔹 実は両方ある
+
+//| 方向           | メソッド                                      | 役割                               |
+//| ------------ | ----------------------------------------- | -------------------------------- |
+//| ホスト → ネットワーク | `IPAddress.HostToNetworkOrder(int value)` | CPUのネイティブ順（たいていリトル）をビッグエンディアンに変換 |
+//| ネットワーク → ホスト | `IPAddress.NetworkToHostOrder(int value)` | ビッグエンディアンをCPUのネイティブ順（リトル）に戻す     |
+
+//両方ちゃんと実装されていて、内部的には同じビット反転処理をしているだけです（CPUがリトルの場合はスワップ、ビッグの場合はそのまま）。
+
+//---
+
+//## 💡 使う場面の典型例
+
+//送信側（クライアントなど）：
+
+//```csharp
+//var len = BitConverter.GetBytes(IPAddress.HostToNetworkOrder(payload.Length));
+//await stream.WriteAsync(len);
+//```
+
+//受信側（サーバーなど）：
+
+//```csharp
+//var lenBuf = new byte[4];
+//await stream.ReadExactlyAsync(lenBuf, 0, 4);
+//int dataLen = IPAddress.NetworkToHostOrder(BitConverter.ToInt32(lenBuf, 0));
+//```
+
+//こうすることで、送信側と受信側のCPUエンディアンが違っても安全に通信できます。
+
+//---
+
+//## 🔍 なぜ「HostToNetworkOrder」が主に使われるか
+
+//* TCP/IPの世界では「ネットワーク上はビッグエンディアン」という標準が**不変**。
+//* だから送信時に「ホスト → ネットワーク」に変換するのが**必ず必要**。
+//* 一方で「NetworkToHostOrder」は、受信時しか使わないので、コード例には出にくいんです。
+
+//---
+
+//## ✅ まとめ
+
+//| メソッド                   | 意味                     | よく使う側         |
+//| ---------------------- | ---------------------- | ------------- |
+//| `HostToNetworkOrder()` | ローカルCPUの順をビッグエンディアンに変換 | 送信時（クライアントなど） |
+//| `NetworkToHostOrder()` | ビッグエンディアンをローカルCPU順に戻す  | 受信時（サーバーなど）   |
+
+//---
+
+//つまりあなたの言う通り、
+
+//> 「ビッグエンディアンが標準で、それに合わせるための変換メソッド」
+
+//という認識が正しくて、
+//しかも「逆方向もあるけど出番が少ない」っていう、地味に歴史の名残りを今でも背負ってるAPIなんです 😊
