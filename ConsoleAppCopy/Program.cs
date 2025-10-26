@@ -4,6 +4,7 @@ using System.IO;
 using System.IO.Compression;
 using System.Linq;
 using System.Threading;
+using System.Configuration;
 
 namespace ZipReplace48
 {
@@ -21,10 +22,54 @@ namespace ZipReplace48
 
         static int Main(string[] args)
         {
-            // ★環境に合わせて設定
-            var sourceZip = @"C:\package.zip";
-            var targetDir = @"C:\temp\Work";
-            var exeNames = new[] { "a.exe", "b.exe", "c.exe" };
+            //// ★環境に合わせて設定
+            //var sourceZip = @"C:\package.zip";
+            //var targetDir = @"C:\temp\Work";
+            //var exeNames = new[] { "a.exe", "b.exe", "c.exe" };
+
+            //// App.config から設定を取得
+            //var sourceZip = ConfigurationManager.AppSettings["SourceZip"];
+            //var targetDir = ConfigurationManager.AppSettings["TargetDir"];
+            //var exeNames = (ConfigurationManager.AppSettings["ExeNames"] ?? "")
+            //                  .Split(',')
+            //                  .Select(x => x.Trim())
+            //                  .Where(x => !string.IsNullOrEmpty(x))
+            //                  .ToArray();
+
+            //if (string.IsNullOrEmpty(sourceZip) || string.IsNullOrEmpty(targetDir) || exeNames.Length == 0)
+            //{
+            //    Log("App.config の設定が不足しています。");
+            //    return ExitMissing;
+            //}
+
+            // --- 任意の設定ファイルを指定 ---
+            var configPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "myapp.config");
+
+            if (!File.Exists(configPath))
+            {
+                Console.WriteLine($"設定ファイルが見つかりません: {configPath}");
+                return 1;
+            }
+
+            var fileMap = new ExeConfigurationFileMap { ExeConfigFilename = configPath };
+            var config = ConfigurationManager.OpenMappedExeConfiguration(fileMap, ConfigurationUserLevel.None);
+
+            // --- 設定値を取得 ---
+            var sourceZip = config.AppSettings.Settings["SourceZip"]?.Value;
+            var targetDir = config.AppSettings.Settings["TargetDir"]?.Value;
+            var exeNamesRaw = config.AppSettings.Settings["ExeNames"]?.Value;
+
+            var exeNames = (exeNamesRaw ?? "")
+                .Split(',')
+                .Select(x => x.Trim())
+                .Where(x => !string.IsNullOrEmpty(x))
+                .ToArray();
+
+            if (string.IsNullOrEmpty(sourceZip) || string.IsNullOrEmpty(targetDir) || exeNames.Length == 0)
+            {
+                Console.WriteLine("設定値が不足しています。");
+                return 1;
+            }
 
             // 多重起動防止（対象ディレクトリ単位で排他）
             string mutexName = @"Global\ZipReplace48_" + targetDir.Replace('\\', '_').Replace(':', '_');
