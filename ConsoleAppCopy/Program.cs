@@ -594,3 +594,86 @@ static DateTime? GetDirectoryLatestWriteTimeUtc(string path)
 static DateTime MaxUtc(DateTime a, DateTime b) => a >= b ? a : b;
 
 // --- IsAnyProcessRunning / ReplaceFolderWithZipSafe などは元のまま ---
+
+
+
+
+
+
+
+
+
+
+
+
+
+いいですね、その前提（専用フォルダ）なら今の判定が一番スッキリで堅いです。
+仕上げとして、実運用で効く“仕上げの小ワザ”だけ置いておきます。
+
+## 仕上げの実装ポイント（短縮版）
+
+```csharp
+// 前提：targetDir はこのアプリ専用名
+if (!Directory.Exists(targetDir))
+{
+    Log("対象フォルダが存在しないため、処理を行いません。");
+return ExitNoWork;
+}
+
+if (!File.Exists(sourceZip))
+{
+    Log("元ZIP が見つからないため、処理を行いません。");
+    return ExitMissing;
+}
+
+var targetZip = Path.Combine(targetDir, Path.GetFileName(sourceZip));
+var exePaths = exeNames.Select(n => Path.Combine(targetDir, n)).ToArray();
+
+// 実行中プロセスがいたら安全側でスキップ
+if (IsAnyProcessRunning(exePaths))
+{
+    Log("対象のプロセスが稼働中のため、処理を行いません。");
+    return ExitNoWork;
+}
+
+bool dirEmpty = IsDirectoryEmpty(targetDir);
+bool hasTargetZip = File.Exists(targetZip);
+
+var srcZipTimeUtc = File.GetLastWriteTimeUtc(sourceZip);
+
+// 対象側の“新しさ”＝ (対象側ZIPの時刻, 配下ファイルの最終更新) の最大
+DateTime? targetZipTimeUtc = hasTargetZip ? File.GetLastWriteTimeUtc(targetZip) : (DateTime?)null;
+var dirLatestUtc = GetDirectoryLatestWriteTimeUtc(targetDir);
+var baselineUtc = MaxUtc(targetZipTimeUtc ?? DateTime.MinValue, dirLatestUtc ?? DateTime.MinValue);
+
+bool shouldReplace = dirEmpty || !hasTargetZip || srcZipTimeUtc > baselineUtc;
+
+if (!shouldReplace)
+{
+    Log("更新不要のため、差し替えは行いません。");
+    return ExitNoWork;
+}
+
+// 直前再チェック（Race 回避）
+if (IsAnyProcessRunning(exePaths))
+{
+    Log("チェック後に対象プロセスが稼働開始したため、中断します。");
+    return ExitNoWork;
+}
+
+ReplaceFolderWithZipSafe(sourceZip, targetDir, Path.GetFileName(sourceZip), exePaths);
+Log("差し替えが完了しました。");
+return ExitReplaced;
+```
+
+## 運用で効く小ワザ
+
+***時計ズレ対策 * *：`srcZipTimeUtc > baselineUtc.AddSeconds(1)` のように1秒マージンを足すと、NAS/ZIP作成環境との微妙なズレで無限差し替え/未差し替えを避けられます。
+* **ZIP時刻の粒度**：古いZIPツールは秒未満切捨てのことがあるので、上と同じくマージン有効。
+* **排他の安定性**：Mutex 名は既に `Global\` + 正規化済みでOK。サービス/複数ユーザーでも衝突しづらいです。
+* **AV/EDRとの相性**：`ClearDirectory`/`CopyAll` は既に指数バックオフ `Retry` あり。AVが噛む環境なら試行回数や初期待機を少し増やすと安定（例：`attempts: 7, initialDelayMs: 120`）。
+***ログの判別性 * *：20分ごとに回るなら、更新判定の各理由（空/ZIP無し/時刻新しい）をログに出しておくと、後から「なぜ動いたか/動かなかったか」が追いやすいです。
+* **ディレクトリ再生成モード**（任意）：専用フォルダ前提なら、存在しない場合は `Directory.CreateDirectory(targetDir)` して即差し替え、というポリシーもあり（今回は「存在していればだけでOK」なので現状維持で）。
+
+この形なら「専用フォルダ × 20分間隔 × リトライあり」の要件にきれいにハマります。
+他にも「差し替え後の簡易ヘルスチェック（EXE存在/主要ファイル数）」を足すと、検知もしやすくなりますが、必要ならその断片も用意します。
