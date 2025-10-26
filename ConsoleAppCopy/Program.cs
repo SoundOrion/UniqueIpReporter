@@ -452,3 +452,145 @@ namespace ZipReplace48
 
 //サービスから `cmd.exe /c` で呼ぶ場合にこれを付けておけば、
 //**画面にもログにも出ず、完全なバックグラウンド処理**になります。
+
+
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.IO.Compression;
+using System.Linq;
+using System.Threading;
+// using System.Configuration; // 設定読み込みを使うなら
+
+// ... 略（クラス/定数は元のまま） ...
+
+static int Main(string[] args)
+{
+    // ★設定（App.configや任意configから読むならここを差し替え）
+    var sourceZip = @"C:\package.zip";
+    var targetDir = @"C:\temp\Work";
+    var exeNames = new[] { "a.exe", "b.exe", "c.exe" };
+
+    string mutexName = @"Global\ZipReplace48_" + targetDir.Replace('\\', '_').Replace(':', '_');
+    using (var mutex = new Mutex(false, mutexName))
+    {
+        if (!mutex.WaitOne(0))
+        {
+            Log("別のインスタンスが実行中のため中断します。");
+            return ExitNoWork;
+        }
+    }
+
+    try
+    {
+        // --- 前提：フォルダの存在だけチェック ---
+        if (!Directory.Exists(targetDir))
+        {
+            Log("対象フォルダが存在しないため、処理を行いません。");
+            return ExitNoWork;
+        }
+
+        // 元ZIPは必須（ここは従来どおり）
+        if (!File.Exists(sourceZip))
+        {
+            Log("元ZIP が見つからないため、処理を行いません。");
+            return ExitMissing;
+        }
+
+        var targetZip = Path.Combine(targetDir, Path.GetFileName(sourceZip));
+        var exePaths = exeNames.Select(n => Path.Combine(targetDir, n)).ToArray();
+
+        // 任意：プロセス稼働チェック（安全のため維持）
+        if (IsAnyProcessRunning(exePaths))
+        {
+            Log("対象の実行ファイルに対応するプロセスが稼働中のため、処理を行いません。");
+            return ExitNoWork;
+        }
+
+        // --- 更新要否の判定 ---
+        bool dirEmpty = IsDirectoryEmpty(targetDir);
+        bool hasTargetZip = File.Exists(targetZip);
+
+        var srcZipTimeUtc = File.GetLastWriteTimeUtc(sourceZip);
+
+        // 対象側の「新しさ」＝(a) 対象側ZIPの時刻, (b) 対象フォルダ配下ファイルの最終更新時刻 の最大
+        DateTime? targetZipTimeUtc = hasTargetZip ? File.GetLastWriteTimeUtc(targetZip) : (DateTime?)null;
+        var dirLatestUtc = GetDirectoryLatestWriteTimeUtc(targetDir);
+        var baselineUtc = MaxUtc(targetZipTimeUtc ?? DateTime.MinValue, dirLatestUtc ?? DateTime.MinValue);
+
+        Log($"元ZIP(UTC): {srcZipTimeUtc:O}");
+        Log($"対象側基準(UTC): {baselineUtc:O}");
+        Log($"対象フォルダは空?: {dirEmpty}, 対象側ZIPあり?: {hasTargetZip}");
+
+        // ① フォルダが空 → 更新
+        // ② 対象側ZIPが無い → 更新
+        // ③ 上記以外 → 元ZIPが基準より新しければ更新
+        bool shouldReplace = dirEmpty || !hasTargetZip || srcZipTimeUtc > baselineUtc;
+
+        if (!shouldReplace)
+        {
+            Log("更新の必要がないため、差し替えは行いません。");
+            return ExitNoWork;
+        }
+
+        // クリティカル区間直前の再チェック
+        if (IsAnyProcessRunning(exePaths))
+        {
+            Log("チェック後に対象のプロセスが稼働開始したため、中断します。");
+            return ExitNoWork;
+        }
+
+        // --- 差し替え ---
+        ReplaceFolderWithZipSafe(sourceZip, targetDir, Path.GetFileName(sourceZip), exePaths);
+
+        Log("差し替えが完了しました。");
+        return ExitReplaced;
+    }
+    catch (Exception ex)
+    {
+        Log("エラーが発生しました: " + ex);
+        return ExitError;
+    }
+}
+
+// ---- 追加ヘルパ ----
+static bool IsDirectoryEmpty(string path)
+{
+    try
+    {
+        return !Directory.EnumerateFileSystemEntries(path).Any();
+    }
+    catch
+    {
+        // アクセスできない場合は保守的に「空ではない」とみなす
+        return false;
+    }
+}
+
+static DateTime? GetDirectoryLatestWriteTimeUtc(string path)
+{
+    try
+    {
+        var files = Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories);
+        DateTime latest = DateTime.MinValue;
+        bool any = false;
+        foreach (var f in files)
+        {
+            DateTime t;
+            try { t = File.GetLastWriteTimeUtc(f); }
+            catch { continue; }
+            if (t > latest) latest = t;
+            any = true;
+        }
+        return any ? latest : (DateTime?)null;
+    }
+    catch
+    {
+        // 取れなければ「なし」
+        return null;
+    }
+}
+
+static DateTime MaxUtc(DateTime a, DateTime b) => a >= b ? a : b;
+
+// --- IsAnyProcessRunning / ReplaceFolderWithZipSafe などは元のまま ---
